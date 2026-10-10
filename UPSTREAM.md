@@ -22,6 +22,40 @@ The first commit of this repository is the upstream snapshot as published. One f
 - **Engine source (`src/`, `include/`):** unchanged so far. The engine's own program is compiled into the
   binary with its entry point renamed; the front end starts it as a child process.
 
+## Changes in this fork
+
+A further fork, to run the model across several GPUs and to load the three- and four-shard Unsloth
+quantisations. Three limits of the front end blocked that; the engine needed no changes for any of
+them.
+
+- **Multi-GPU (the layer split) is allowed again.** The front end refused `--layer-split` and
+  `--split-device`, but that was a policy blocklist with no code behind it: the front end holds no
+  CUDA state at all (it is a pipe-driven HTTP shim) and the engine's split code is upstream's,
+  intact. Both flags now reach the engine, and a front-end `--gpus D[,D..]` sets the child's
+  `CUDA_VISIBLE_DEVICES` and derives `--layer-split auto --split-device ...`. The engine has no
+  device-selection flag, so `CUDA_VISIBLE_DEVICES` is the only way to choose the main card; it also
+  renumbers the devices, which is why `--split-device` gets positions in the list rather than
+  nvidia-smi numbers. `--peer-device`, `--peer-slots`, `--remote-expert`, `--vision` and `--batch`
+  stay refused, now each with its own reason.
+  *Why it matters:* one 48 GB card holds only 52% of UD-Q4_K_XL's experts and 81% of IQ3_S's, and
+  every miss is a round trip to the CPU pool. Two cards hold all of IQ3_S; the XL needs two on a
+  48 GB card or four on a 32 GB one.
+- **Models with more than two shards load.** `--model` was required to match `-00001-of-00002`, so
+  only the 2-shard GSQ-RCO files worked. Unsloth's UD-IQ4_XS has 3 shards and UD-Q4_K_XL has 4. The
+  shard total is now read from the name, every shard is checked to be present, and `--ple-gguf` is
+  passed only when there are at most two — with three or more the engine finds the PLE table's shard
+  itself from shard 1, which is what upstream's `setup.py` does at step 7.
+- **The Makefile can build for Volta.** `EXPERIMENTAL_SM60=1` and `NVCC=<a 12.x nvcc>` were not
+  reachable through `make`. CUDA 13 cannot compile sm_60/sm_70 at all, and the CUDA 12 build covers
+  sm_60..sm_89 plus PTX, so one binary serves a V100 and an L40S:
+  `CUDA_ARCHS='70;89' EXPERIMENTAL_SM60=1 NVCC=/usr/local/cuda-12.8/bin/nvcc make build`.
+
+Not addressed: this fork is still engine 0.1.39 (upstream Strata is 0.1.41), so it lacks
+`STRATA_SM70_TABLE` — the opt-in Volta decode kernels — along with the Linux file tier and
+`--kv k8v4` KV streaming. The removed test suite also took `qsa_prompt_attn_parity`, the documented
+way to check the Volta kernels. UD-Q4_K_XL has not been run on sm_70 by anyone; upstream's V100
+measurements used UD-IQ4_XS.
+
 Code paths for other models, AMD cards and Windows are still present in the engine source. They are not
 built by `make build`, not tested and not supported here. They are left in place so the engine stays
 identical to upstream and can be updated by re-importing it.

@@ -41,7 +41,7 @@ One configuration, on purpose:
 | | |
 | --- | --- |
 | Model | Qwen3.8-Flash-Next, GSQ-RCO IQ3_XXS, with the draft (MTP) head |
-| GPU | One NVIDIA card with 24 GB or more, RTX 30 series or newer |
+| GPU | One or more NVIDIA cards, 24 GB or more each, RTX 30 series or newer (`--gpus`); Volta/Pascal through `EXPERIMENTAL_SM60=1` |
 | RAM | 128 GB |
 | CPU | x86-64 with AVX2 |
 | OS | Linux |
@@ -75,8 +75,18 @@ driver and the CUDA runtime libraries there, as llama.cpp does.
 ```
 
 It listens on `127.0.0.1:8080` and serves `POST /v1/chat/completions` (with streaming), `GET /v1/models` and
-`GET /health`. Loading takes a few minutes. Options: `--ctx N` (default 32768), `--threads N`, `--host`,
-`--port`. Inside a container set `--threads` yourself: the default is every physical core of the host.
+`GET /health`. Loading takes a few minutes.
+
+Across several cards, as nvidia-smi numbers them, the first being the main one:
+
+```
+./unbiased-strata --gpus 0,1 --model /models/...-00001-of-00004.gguf --pack /models/pack-xl --mtp /models/mtp
+```
+
+Each card keeps an expert cache for its own layers, so two cards hold about twice what one holds.
+This is pipeline (layer) parallelism, not tensor parallelism: a token crosses between cards once per
+verify window, so extra cards buy cache room rather than single-stream speed. See UPSTREAM.md. Options: `--ctx N` (default 32768), `--threads N`, `--host`,
+`--port`, `--gpus D[,D..]`. Inside a container set `--threads` yourself: the default is every physical core of the host.
 
 Requests are greedy unless they set a `temperature` above zero. The model thinks before it answers; send
 `"reasoning_effort": "none"` to turn that off. Tool calling follows the OpenAI format (`tools`, `tool_calls`).
