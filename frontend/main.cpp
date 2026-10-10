@@ -45,20 +45,81 @@ struct Options {
     int port = 8080;
     long long ctx = 32768;
     int threads = 0;                    // CPU expert workers; 0 = the engine's default (every physical core)
+    std::vector<int> gpus;              // --gpus 0,2: stage order, first is the main card; empty = one GPU
     std::vector<std::string> extra;     // after `--`: passed to the engine as they are
 };
+
+// Options this fork does not serve, and why. The layer split is deliberately NOT here:
+// --layer-split / --split-device now reach the engine, whose multi-GPU code is upstream's
+// and untouched (src/core/verify.cpp, layer.cpp, mtp.cpp all handle stages). See UPSTREAM.md.
+struct Refused { const char* flag; const char* why; };
+const Refused kRefused[] = {
+    {"--gpus",          "use the front end's own --gpus, before `--`: it sets CUDA_VISIBLE_DEVICES"},
+    {"--peer-device",   "the peer expert cache is not wired up in this fork"},
+    {"--peer-slots",    "the peer expert cache is not wired up in this fork"},
+    {"--remote-expert", "remote experts are not wired up in this fork"},
+    {"--vision",        "no image encoder is built here (text only)"},
+    {"--batch",         "the front end serves one request at a time"},
+};
+
+// GGUF split names end "-<part>-of-<total>", five digits each. A 2-shard file is the
+// ISTA-DASLab GSQ-RCO layout; Unsloth's UD-IQ4_XS has 3 and UD-Q4_K_XL has 4, so the
+// count has to be read from the name rather than assumed.
+bool split_shards(const std::string& shard1, std::vector<std::string>& out, int& total, std::string& err) {
+    const std::string tag = "-00001-of-";
+    const size_t at = shard1.rfind(tag);
+    if (at == std::string::npos || shard1.size() < at + tag.size() + 5) {
+        err = "--model must be a first shard (...-00001-of-000NN.gguf)";
+        return false;
+    }
+    const std::string digits = shard1.substr(at + tag.size(), 5);
+    if (digits.find_first_not_of("0123456789") != std::string::npos) {
+        err = "--model's shard total is not five digits (...-00001-of-000NN.gguf)";
+        return false;
+    }
+    total = std::atoi(digits.c_str());
+    if (total < 1 || total > 999) { err = "--model's shard total is out of range"; return false; }
+    out.clear();
+    for (int i = 1; i <= total; ++i) {
+        char part[24];
+        std::snprintf(part, sizeof part, "-%05d-of-%05d", i, total);
+        std::string sh = shard1;
+        sh.replace(at, tag.size() + 5, part);
+        out.push_back(sh);
+    }
+    return true;
+}
+
+// "0,2" -> {0,2}; false on anything else.
+bool parse_int_list(const std::string& v, std::vector<int>& out) {
+    out.clear();
+    size_t i = 0;
+    while (i <= v.size()) {
+        size_t c = v.find(',', i);
+        if (c == std::string::npos) c = v.size();
+        const std::string tok = v.substr(i, c - i);
+        if (tok.empty() || tok.find_first_not_of("0123456789") != std::string::npos) return false;
+        out.push_back(std::atoi(tok.c_str()));
+        if (c == v.size()) break;
+        i = c + 1;
+    }
+    return !out.empty();
+}
 
 void usage() {
     std::fprintf(stderr,
         "usage: unbiased-strata --model SHARD1.gguf --pack DIR --mtp DIR [options] [-- engine options]\n\n"
-        "  --model PATH    the model's first GGUF shard (...-00001-of-00002.gguf); the second must be beside it\n"
+        "  --model PATH    the model's first GGUF shard (...-00001-of-000NN.gguf); every shard must be beside it\n"
         "  --pack DIR      the prepared pack for that model\n"
         "  --mtp DIR       the prepared draft head\n"
         "  --ctx N         context length in tokens (default 32768)\n"
         "  --threads N     CPU threads for the experts the GPU does not hold (default: every physical core;\n"
         "                  set it inside a container, where the host's core count is not yours)\n"
         "  --host ADDR     address to listen on (default 127.0.0.1)\n"
-        "  --port N        port to listen on (default 8080)\n\n"
+        "  --port N        port to listen on (default 8080)\n"
+        "  --gpus D[,D..]  CUDA devices to split the model's layers across, as nvidia-smi numbers; the\n"
+        "                  first is the main card. One card holds only part of a large model's experts,\n"
+        "                  and every miss costs a round trip to the CPU pool. Default: one GPU.\n\n"
         "Serves POST /v1/chat/completions (OpenAI style, with streaming), GET /v1/models and GET /health.\n");
 }
 
@@ -79,7 +140,7 @@ struct GenResult {
 
 class Engine {
 public:
-    bool start(const std::vector<std::string>& args, std::string& err) {
+    bool start(const std::vector<std::string>& args, const std::string& cuda_visible, std::string& err) {
         int to_child[2], from_child[2];
         if (::pipe(to_child) != 0 || ::pipe(from_child) != 0) { err = "pipe failed"; return false; }
         pid_ = ::fork();
@@ -88,6 +149,9 @@ public:
             ::dup2(to_child[0], STDIN_FILENO);
             ::dup2(from_child[1], STDOUT_FILENO);
             ::close(to_child[0]); ::close(to_child[1]); ::close(from_child[0]); ::close(from_child[1]);
+            // Set in the CHILD, after fork: the parent reads the tokenizer through llama.cpp
+            // and must keep its own view of the devices.
+            if (!cuda_visible.empty()) ::setenv("CUDA_VISIBLE_DEVICES", cuda_visible.c_str(), 1);
             std::vector<char*> argv;
             for (const std::string& a : args) argv.push_back(const_cast<char*>(a.c_str()));
             argv.push_back(nullptr);
@@ -530,14 +594,18 @@ bool parse_args(int argc, char** argv, Options& o) {
         else if (a == "--port") o.port = std::atoi(next("--port").c_str());
         else if (a == "--ctx") o.ctx = std::atoll(next("--ctx").c_str());
         else if (a == "--threads") o.threads = std::atoi(next("--threads").c_str());
+        else if (a == "--gpus") {
+            if (!parse_int_list(next("--gpus"), o.gpus)) {
+                std::fprintf(stderr, "unbiased-strata: --gpus wants a comma-separated device list, e.g. 0,1\n");
+                return false;
+            }
+        }
         else if (a == "--") {
             for (++i; i < argc; ++i) {
                 const std::string e = argv[i];
-                // one GPU only: the engine's multi-GPU and remote-expert modes are not part of this fork
-                for (const char* no : {"--gpus", "--layer-split", "--split-device", "--peer-device", "--peer-slots",
-                                       "--remote-expert", "--vision", "--batch"})
-                    if (e.rfind(no, 0) == 0) {
-                        std::fprintf(stderr, "unbiased-strata: %s is not supported (single GPU, text only)\n", e.c_str());
+                for (const Refused& r : kRefused)
+                    if (e.rfind(r.flag, 0) == 0) {
+                        std::fprintf(stderr, "unbiased-strata: %s is not supported: %s\n", e.c_str(), r.why);
                         std::exit(2);
                     }
                 o.extra.push_back(e);
@@ -559,30 +627,60 @@ int main(int argc, char** argv) {
     if (!parse_args(argc, argv, o)) { usage(); return 2; }
 
     // every file the engine needs must already be here: nothing is fetched
-    std::string shard2 = o.model;
-    const size_t at = shard2.rfind("-00001-of-00002");
-    if (at == std::string::npos) {
-        std::fprintf(stderr, "unbiased-strata: --model must be the first shard (...-00001-of-00002.gguf)\n");
+    std::vector<std::string> shards;
+    int n_shards = 0;
+    std::string serr;
+    if (!split_shards(o.model, shards, n_shards, serr)) {
+        std::fprintf(stderr, "unbiased-strata: %s\n", serr.c_str());
         return 2;
     }
-    shard2.replace(at, 15, "-00002-of-00002");
     const std::string profile = o.pack + "/expert-profile.bin";
-    for (const std::string& f : {o.model, shard2, o.pack + "/index.txt", profile, o.mtp + "/experts.bin",
-                                 o.mtp + "/draft_vocab.bin"})
+    std::vector<std::string> need = shards;
+    need.push_back(o.pack + "/index.txt");
+    need.push_back(profile);
+    need.push_back(o.mtp + "/experts.bin");
+    need.push_back(o.mtp + "/draft_vocab.bin");
+    for (const std::string& f : need)
         if (!file_exists(f)) { std::fprintf(stderr, "unbiased-strata: missing file: %s\n", f.c_str()); return 2; }
     if (o.ctx < 1024) { std::fprintf(stderr, "unbiased-strata: --ctx must be at least 1024\n"); return 2; }
 
     // the engine, started first: loading takes minutes, and it must be forked before any thread exists
-    std::vector<std::string> eargs = {
-        "unbiased-strata", "--engine", "--serve", "--pack", o.pack, "--native", o.model, "--ple-gguf", shard2,
-        "--expert-profile", profile, "--expert-cache", "auto", "--prefill", "auto", "--spec", "4", "--spec-min-p", "0.5",
-        "--mtp", o.mtp, "--max-context", std::to_string(o.ctx), "--ple-io", "ram"};
+    std::vector<std::string> eargs = {"unbiased-strata", "--engine", "--serve",
+                                      "--pack", o.pack, "--native", o.model};
+    // Upstream passes --ple-gguf only when the file has at most two shards; with three or
+    // more the engine finds the PLE table's shard itself from shard 1 (upstream setup.py,
+    // step 7: "a 4-shard file: the engine finds the PLE table's shard itself from shard 1").
+    if (n_shards <= 2) { eargs.push_back("--ple-gguf"); eargs.push_back(shards.back()); }
+    const std::vector<std::string> tail = {
+        "--expert-profile", profile, "--expert-cache", "auto", "--prefill", "auto",
+        "--spec", "4", "--spec-min-p", "0.5", "--mtp", o.mtp,
+        "--max-context", std::to_string(o.ctx), "--ple-io", "ram"};
+    eargs.insert(eargs.end(), tail.begin(), tail.end());
     if (o.ctx > 8192) { eargs.push_back("--kv"); eargs.push_back("int8"); }
     if (o.threads > 0) { eargs.push_back("--pool-workers"); eargs.push_back(std::to_string(o.threads)); }
+
+    // --gpus 0,2 -> the child sees those two cards as 0 and 1, so stage 0 lands on the
+    // first one named and the later stages get --split-device 1[,2..]. The engine takes
+    // one split point fewer than it has stages, or "auto" to place them by free VRAM.
+    std::string cuda_visible;
+    if (!o.gpus.empty()) {
+        for (size_t i = 0; i < o.gpus.size(); ++i)
+            cuda_visible += (i ? "," : "") + std::to_string(o.gpus[i]);
+        if (o.gpus.size() > 1) {
+            bool user_split = false;
+            for (const std::string& e : o.extra)
+                if (e.rfind("--layer-split", 0) == 0) user_split = true;
+            if (!user_split) { eargs.push_back("--layer-split"); eargs.push_back("auto"); }
+            std::string devs;
+            for (size_t i = 1; i < o.gpus.size(); ++i) devs += (i > 1 ? "," : "") + std::to_string(i);
+            eargs.push_back("--split-device");
+            eargs.push_back(devs);
+        }
+    }
     for (const std::string& e : o.extra) eargs.push_back(e);
     std::signal(SIGPIPE, SIG_IGN);
     std::string err;
-    if (!srv.engine.start(eargs, err)) { std::fprintf(stderr, "unbiased-strata: %s\n", err.c_str()); return 1; }
+    if (!srv.engine.start(eargs, cuda_visible, err)) { std::fprintf(stderr, "unbiased-strata: %s\n", err.c_str()); return 1; }
 
     // the tokenizer and the chat template, from the GGUF itself
     llama_log_set(quiet_log, nullptr);
