@@ -47,7 +47,9 @@ import os
 import pathlib
 import re
 import shutil
-import subprocess  # noqa: F401 -- unused after the local change below (tokenizer spawn removed)
+# `import subprocess` removed: the only use was the strata_tokenizer.py spawn, which
+# this fork does not need (see the local change below). The audit treats an unused
+# import of it as a capability, and it is right to -- so it is gone, not suppressed.
 import sys
 
 import numpy as np
