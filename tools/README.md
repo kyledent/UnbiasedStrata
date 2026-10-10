@@ -39,9 +39,11 @@ differs between the pin and `main`, and the pinned version is the one here.
 | `mtp_rt.py` | converts that GGUF into the engine's runtime layout: `experts.bin`, `dense.bin` |
 | `_paths.py` | finds llama.cpp's `gguf-py`. In this fork it resolves to `third_party/llama.cpp/gguf-py` with no `STRATA_GGUF_PY` needed |
 | `gguf_reader.py` | the minimal GGUF reader `iq_pack.py` uses |
+| `mtp_pinned.py` | **ours, data only** — the pinned MTP checkpoint revision and the 31 per-tensor SHA256. No imports, no code |
 
 **Not vendored:** `mtp_fetch.py`, replaced by `strata/mtp_fetch_safe.py` in the
-deployment repo — it is the only networked tool and its output is provably checkable
+deployment repo — but its two pinned constants are, as `mtp_pinned.py`, because the
+replacement still needs the verification oracle even though it does not need the tool — it is the only networked tool and its output is provably checkable
 against pinned hashes, so it was worth owning. Also **not** vendored:
 `strata_tokenizer.py`, because this fork has no use for it (below).
 
